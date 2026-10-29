@@ -27,8 +27,8 @@ settings:
     SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited)
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: PM27C7JC3M
-    MARKETING_VERSION: "3.0.0"
-    CURRENT_PROJECT_VERSION: "2"
+    MARKETING_VERSION: "3.1.0"
+    CURRENT_PROJECT_VERSION: "31"
 
 packages:
   GRDB:
@@ -69,8 +69,8 @@ targets:
       path: App-Info.plist
       properties:
         CFBundleDisplayName: Tiger iptv
-        CFBundleShortVersionString: "3.0.0"
-        CFBundleVersion: "30"
+        CFBundleShortVersionString: "3.1.0"
+        CFBundleVersion: "31"
         LSApplicationCategoryType: public.app-category.entertainment
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
