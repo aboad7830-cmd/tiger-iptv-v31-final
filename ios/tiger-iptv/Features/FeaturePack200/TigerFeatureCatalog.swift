@@ -292,7 +292,7 @@ final class TigerFeatureFlags: ObservableObject {
 
     // Thread-safe snapshot so nonisolated callers (e.g. the mpv controller)
     // can query flags without hopping to the main actor.
-    private static let snapshotLock = NSLock()
+    nonisolated(unsafe) private static let snapshotLock = NSLock()
     nonisolated(unsafe) private static var snapshot: Set<String> = []
 
     private init() {
@@ -304,7 +304,7 @@ final class TigerFeatureFlags: ObservableObject {
         Self.publishSnapshot(enabledIDs)
     }
 
-    private static func publishSnapshot(_ ids: Set<String>) {
+    nonisolated private static func publishSnapshot(_ ids: Set<String>) {
         snapshotLock.lock()
         snapshot = ids
         snapshotLock.unlock()

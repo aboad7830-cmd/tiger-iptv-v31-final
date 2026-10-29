@@ -379,7 +379,7 @@ final class DownloadManager: NSObject, ObservableObject {
             try DBDownloadedItem
                 .filter(Column("status") == DownloadStatus.completed.rawValue)
                 .fetchAll(db)
-                .reduce(Int64(0)) { $0 + max($1.totalBytes, 0) }
+                .reduce(Int64(0)) { $0 + Int64(max($1.totalBytes, 0)) }
         }) ?? 0
     }
 

@@ -200,34 +200,36 @@ final class TigerFeatureRuntime: ObservableObject {
 
     // MARK: Flag access
 
-    func isOn(_ id: String) -> Bool { flags.isOn(id) }
+    nonisolated func isOn(_ id: String) -> Bool { TigerFeatureFlags.shared.isOn(id) }
 
-    private func bool(_ id: String, _ key: String, _ fallback: Bool) -> Bool {
+    nonisolated private func bool(_ id: String, _ key: String, _ fallback: Bool) -> Bool {
         guard isOn(id) else { return false }
-        if defaults.object(forKey: key) == nil { return fallback }
-        return defaults.bool(forKey: key)
+        let d = UserDefaults.standard
+        if d.object(forKey: key) == nil { return fallback }
+        return d.bool(forKey: key)
     }
 
-    private func int(_ id: String, _ key: String, _ fallback: Int) -> Int {
+    nonisolated private func int(_ id: String, _ key: String, _ fallback: Int) -> Int {
         guard isOn(id) else { return fallback }
-        let value = defaults.integer(forKey: key)
+        let value = UserDefaults.standard.integer(forKey: key)
         return value == 0 ? fallback : value
     }
 
-    private func double(_ id: String, _ key: String, _ fallback: Double) -> Double {
+    nonisolated private func double(_ id: String, _ key: String, _ fallback: Double) -> Double {
         guard isOn(id) else { return fallback }
-        if defaults.object(forKey: key) == nil { return fallback }
-        return defaults.double(forKey: key)
+        let d = UserDefaults.standard
+        if d.object(forKey: key) == nil { return fallback }
+        return d.double(forKey: key)
     }
 
-    private func string(_ id: String, _ key: String, _ fallback: String) -> String {
+    nonisolated private func string(_ id: String, _ key: String, _ fallback: String) -> String {
         guard isOn(id) else { return fallback }
-        return defaults.string(forKey: key) ?? fallback
+        return UserDefaults.standard.string(forKey: key) ?? fallback
     }
 
     // MARK: Policies
 
-    var playbackPolicy: TigerPlaybackPolicy {
+    nonisolated var playbackPolicy: TigerPlaybackPolicy {
         var p = TigerPlaybackPolicy()
         p.resumeEnabled = bool("f002", "tiger.playback.resume", true)
         p.autoNextEnabled = bool("f003", "tiger.playback.autoNext", true)
@@ -258,7 +260,7 @@ final class TigerFeatureRuntime: ObservableObject {
         return p
     }
 
-    var downloadPolicy: TigerDownloadPolicy {
+    nonisolated var downloadPolicy: TigerDownloadPolicy {
         var p = TigerDownloadPolicy()
         p.smartQuality = bool("f120", "tiger.downloads.smartQuality", true)
         p.wifiOnly = bool("f121", "tiger.downloads.wifiOnly", true)
@@ -275,7 +277,7 @@ final class TigerFeatureRuntime: ObservableObject {
         return p
     }
 
-    var privacyPolicy: TigerPrivacyPolicy {
+    nonisolated var privacyPolicy: TigerPrivacyPolicy {
         var p = TigerPrivacyPolicy()
         p.appLock = bool("f144", "tiger.privacy.appLock", false)
         p.hideAdult = bool("f145", "tiger.privacy.hideAdult", true)
@@ -288,7 +290,7 @@ final class TigerFeatureRuntime: ObservableObject {
         return p
     }
 
-    var accessibilityPolicy: TigerAccessibilityPolicy {
+    nonisolated var accessibilityPolicy: TigerAccessibilityPolicy {
         var p = TigerAccessibilityPolicy()
         p.largeText = bool("f152", "tiger.access.largeText", false)
         p.highContrast = bool("f153", "tiger.access.highContrast", false)
@@ -303,7 +305,7 @@ final class TigerFeatureRuntime: ObservableObject {
         return p
     }
 
-    var powerPolicy: TigerPowerPolicy {
+    nonisolated var powerPolicy: TigerPowerPolicy {
         var p = TigerPowerPolicy()
         p.batterySaver = bool("f194", "tiger.power.batterySaver", true)
         p.pauseBackgroundMotion = bool("f195", "tiger.power.pauseMotion", true)
@@ -646,6 +648,7 @@ final class TigerFeatureRuntime: ObservableObject {
 
 // MARK: - Capture shield (f149)
 
+#if os(iOS)
 /// غطاء يمنع ظهور المحتوى أثناء تسجيل الشاشة أو أخذ لقطة (ميزة الخصوصية f149).
 struct TigerCaptureShield: View {
     @State private var isCaptured: Bool = false
@@ -666,17 +669,14 @@ struct TigerCaptureShield: View {
                 .ignoresSafeArea()
             }
         }
-        .onAppear { refresh() }
+        .onAppear { isCaptured = UIScreen.main.isCaptured }
         .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
-            refresh()
+            isCaptured = UIScreen.main.isCaptured
         }
     }
-
-    private func refresh() {
-        #if os(iOS)
-        isCaptured = UIScreen.main.isCaptured
-        #else
-        isCaptured = false
-        #endif
-    }
 }
+#else
+struct TigerCaptureShield: View {
+    var body: some View { EmptyView() }
+}
+#endif
