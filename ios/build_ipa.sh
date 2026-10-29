@@ -231,7 +231,12 @@ if [[ $UNSIGNED -eq 1 ]]; then
   rm -rf "$STAGE"
   mkdir -p "$STAGE/Payload"
   cp -R "$APP_PATH" "$STAGE/Payload/"
-  ( cd "$STAGE" && /usr/bin/zip -qry "$FINAL_IPA" Payload )
+  # مسار مطلق لأن zip يعمل من داخل مجلد المرحلة (STAGE)
+  mkdir -p "$EXPORT_DIR"
+  ABS_IPA="$(cd "$EXPORT_DIR" && pwd)/$(basename "$FINAL_IPA")"
+  rm -f "$ABS_IPA"
+  ( cd "$STAGE" && /usr/bin/zip -qry "$ABS_IPA" Payload )
+  FINAL_IPA="$ABS_IPA"
   rm -rf "$STAGE"
 else
   echo "› تصدير ملف IPA …"
