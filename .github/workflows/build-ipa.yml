@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build unsigned IPA
@@ -45,3 +48,21 @@ jobs:
           path: ios/build/export/*.ipa
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="v3.1.0-build${{ github.run_number }}"
+          NOTES="TIGER IPTV v3.1.0 — unsigned IPA (build ${{ github.run_number }})
+
+          • جميع المزايا الـ200 موصولة بمحرّك التنفيذ وتعمل فعليًا
+          • IPA غير موقّع — يحتاج توقيع (Sideloadly / AltStore / TrollStore / ESign) قبل التثبيت
+
+          Commit: ${{ github.sha }}"
+          gh release create "$TAG" ios/build/export/*.ipa \
+            --title "TIGER IPTV v3.1.0 (build ${{ github.run_number }})" \
+            --notes "$NOTES" \
+            --latest || true
