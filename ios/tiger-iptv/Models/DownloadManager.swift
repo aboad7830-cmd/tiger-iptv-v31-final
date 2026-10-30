@@ -31,8 +31,13 @@ final class DownloadManager: NSObject, ObservableObject {
     static let sessionIdentifier = (Bundle.main.bundleIdentifier ?? "app") + ".downloads"
     /// Aynı playlist için aynı anda kaç indirme paralel çalışabilir. Üstü kuyruğa alınır.
     /// Başka playlist'lerin kuyruğu etkilenmez — her playlist'in kendi slotu vardır.
-    /// Server connection limitinin playlist bazlı olduğunu varsayıyoruz.
-    static let maxConcurrentPerPlaylist = 1
+    ///
+    /// ÖNEMLİ: Eskiden 1 idi ve indirmeler tek tek (seri) iniyordu; bölüm/film
+    /// listesi indirirken bu "çok yavaş" hissi veriyordu. Artık paralel indirme
+    /// açık (varsayılan 3, `f125` toplu indirme açıksa 4).
+    static var maxConcurrentPerPlaylist: Int {
+        TigerFeatureRuntime.shared.isOn("f125") ? 4 : 3
+    }
     /// Bir indirme hata alınca kaç kez otomatik kuyruğun sonuna geri eklenir. Aşılınca `.failed`.
     private static let maxAutoRetries = 3
 
@@ -54,6 +59,12 @@ final class DownloadManager: NSObject, ObservableObject {
     private var enqueueInFlight: Set<String> = []
     /// Aynı task için didWriteData defalarca tetiklenir; totalBytes'i sadece ilk gerçek değerde DB'ye yazıyoruz.
     private var totalBytesPersistedFor: Set<Int> = []
+    /// didWriteData saniyede yüzlerce kez tetiklenir. Her seferinde `@Published progress`
+    /// güncellemek main thread'i dolduruyor ve delegate kuyruğu (main) tıkandığı için
+    /// indirme hızı düşüyordu. Bu yüzden ilerleme yayınını throttle ediyoruz.
+    private var lastProgressPublish: [Int: (bytes: Int64, at: TimeInterval)] = [:]
+    /// İlerleme yayın aralığı (saniye). 0.2 sn ≈ saniyede 5 güncelleme — akıcı ve hafif.
+    private static let progressPublishInterval: TimeInterval = 0.2
     /// Hata alan indirmelerin bellek içi yeniden-deneme sayacı.
     private var autoRetryCountById: [String: Int] = [:]
     /// `pumpQueue` aynı anda bir kere çalışsın diye — paralel çağrılar `pumpPending`'ı set eder.
@@ -68,7 +79,16 @@ final class DownloadManager: NSObject, ObservableObject {
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
-        config.httpMaximumConnectionsPerHost = 6
+        // Paralel bağlantı sayısını yükselt — tek bağlantıya sıkışmayı engeller.
+        config.httpMaximumConnectionsPerHost = 8
+        config.httpShouldUsePipelining = true
+        // Ağ yoksa bekle (hata verip kuyruğu bozmasın).
+        config.waitsForConnectivity = true
+        // Low Data Mode / pahalı ağ kısıtlamaları indirmeyi yavaşlatıyordu — izin ver.
+        config.allowsExpensiveNetworkAccess = true
+        config.allowsConstrainedNetworkAccess = true
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 60 * 60 * 24
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
         Task { await restoreOutstandingTasks() }
     }
@@ -538,10 +558,20 @@ extension DownloadManager: URLSessionDownloadDelegate {
         MainActor.assumeIsolated {
             let taskId = downloadTask.taskIdentifier
             guard let id = self.taskToId[taskId] else { return }
-            self.progress[id] = DownloadProgress(
-                totalBytes: max(0, totalBytesExpectedToWrite),
-                downloadedBytes: max(0, totalBytesWritten)
-            )
+
+            // İlerlemeyi throttle et: her chunk'ta UI'yı yeniden çizmek main thread'i
+            // doldurup indirmeyi yavaşlatıyordu. 0.2 sn'de bir yayınla.
+            let now = Date.timeIntervalSinceReferenceDate
+            let last = self.lastProgressPublish[taskId]
+            let isFinal = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
+            if isFinal || last == nil || (now - last!.at) >= Self.progressPublishInterval {
+                self.lastProgressPublish[taskId] = (totalBytesWritten, now)
+                self.progress[id] = DownloadProgress(
+                    totalBytes: max(0, totalBytesExpectedToWrite),
+                    downloadedBytes: max(0, totalBytesWritten)
+                )
+            }
+
             if totalBytesExpectedToWrite > 0,
                !self.totalBytesPersistedFor.contains(taskId) {
                 self.totalBytesPersistedFor.insert(taskId)
@@ -612,6 +642,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         MainActor.assumeIsolated {
             let taskId = task.taskIdentifier
             self.totalBytesPersistedFor.remove(taskId)
+            self.lastProgressPublish.removeValue(forKey: taskId)
             guard let id = self.taskToId[taskId] else { return }
             self.taskToId.removeValue(forKey: taskId)
             self.taskToRelativePath.removeValue(forKey: taskId)
