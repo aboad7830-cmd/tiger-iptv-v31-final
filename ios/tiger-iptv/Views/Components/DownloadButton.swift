@@ -60,7 +60,7 @@ struct DownloadButton: View {
 
     private var progress: DownloadProgress? { manager.progress[id] }
 
-    private enum State { case idle, queued, downloading(Double), completed, failed }
+    private enum State { case idle, queued, downloading(DownloadProgress?), completed, failed }
     private var state: State {
         if let item = item {
             switch item.downloadStatus {
@@ -68,7 +68,7 @@ struct DownloadButton: View {
             case .failed: return .failed
             case .queued: return .queued
             case .downloading:
-                return .downloading(progress?.fraction ?? 0)
+                return .downloading(progress)
             }
         }
         return .idle
@@ -122,15 +122,27 @@ struct DownloadButton: View {
         )
     }
 
-    private func downloadingLabel(progress: Double) -> some View {
+    private func downloadingLabel(progress: DownloadProgress?) -> some View {
         HStack(spacing: compact ? 4 : 6) {
-            ProgressView(value: max(0, min(1, progress)))
-                .progressViewStyle(.circular)
-                .controlSize(.mini)
-            Text(L("download.downloading_format", Int(progress * 100)))
-                .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
-                .lineLimit(1)
-                .monospacedDigit()
+            if let progress, progress.hasKnownTotal {
+                ProgressView(value: max(0, min(1, progress.fraction)))
+                    .progressViewStyle(.circular)
+                    .controlSize(.mini)
+                Text(L("download.downloading_format", Int(progress.fraction * 100)))
+                    .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
+                    .lineLimit(1)
+                    .monospacedDigit()
+            } else {
+                // Sunucu Content-Length göndermediyse yüzde hesaplanamaz — belirsiz
+                // (indeterminate) çubuk + indirilen boyut göster, %0'da donmasın.
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.mini)
+                Text(ByteCountFormatter.string(fromByteCount: progress?.downloadedBytes ?? 0, countStyle: .file))
+                    .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
+                    .lineLimit(1)
+                    .monospacedDigit()
+            }
         }
         .foregroundStyle(.primary)
         .frame(maxWidth: compact ? nil : .infinity)

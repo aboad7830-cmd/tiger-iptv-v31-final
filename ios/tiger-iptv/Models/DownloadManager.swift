@@ -8,6 +8,12 @@ import UserNotifications
 
 private let downloadLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "app", category: "Downloads")
 
+/// İlerleme yayın aralığı (saniye). 0.2 sn ≈ saniyede 5 güncelleme — akıcı ve hafif.
+/// Global sabit: delegate kuyruğundan (main dışı) güvenle okunur.
+private let downloadProgressPublishInterval: TimeInterval = 0.2
+/// task.taskDescription içinde id ile relPath'i ayıran karakter (U+001F).
+private let downloadTaskSeparator = "\u{001F}"
+
 /// İndirme ilerlemesinin bellek içi temsili — UI sıkça değiştiği için DB'ye yazmayız.
 struct DownloadProgress: Equatable {
     let totalBytes: Int64
@@ -24,9 +30,11 @@ struct DownloadProgress: Equatable {
     }
 }
 
-/// Seri kuyruk: aynı anda yalnızca 1 indirme çalışır. Gerisi `.queued` DB status'üyle bekler.
-/// `createdAt`'a göre sıralanır; biri bitince bir sonraki otomatik başlar. Uygulama yeniden
-/// açıldığında yarım kalan indirmeler kuyruğun başına geri alınıp tek tek devam ettirilir.
+/// Paralel kuyruk: her playlist için aynı anda `maxConcurrentPerPlaylist` (3–4)
+/// indirme çalışır, gerisi `.queued` DB status'üyle bekler. `createdAt`'a göre
+/// sıralanır; biri bitince bir sonraki otomatik başlar. Uygulama yeniden açıldığında
+/// yarım kalan indirmeler kuyruğa geri alınıp devam ettirilir. Ayrıca bir watchdog,
+/// veri akışı 45 sn boyunca durursa task'i otomatik yeniden başlatır.
 ///
 /// Background indirme için `URLSessionConfiguration.background` kullanır; OS uygulamayı
 /// sonlandırsa bile iOS indirmeyi sürdürür ve bitince app'i uyandırarak delegate'i çağırır.
@@ -66,11 +74,8 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Aynı task için didWriteData defalarca tetiklenir; totalBytes'i sadece ilk gerçek değerde DB'ye yazıyoruz.
     private var totalBytesPersistedFor: Set<Int> = []
     /// didWriteData saniyede yüzlerce kez tetiklenir. Her seferinde `@Published progress`
-    /// güncellemek main thread'i dolduruyor ve delegate kuyruğu (main) tıkandığı için
-    /// indirme hızı düşüyordu. Bu yüzden ilerleme yayınını throttle ediyoruz.
-    private var lastProgressPublish: [Int: (bytes: Int64, at: TimeInterval)] = [:]
-    /// İlerleme yayın aralığı (saniye). 0.2 sn ≈ saniyede 5 güncelleme — akıcı ve hafif.
-    private static let progressPublishInterval: TimeInterval = 0.2
+    /// güncellemek main thread'i dolduruyor ve indirme hızını düşürüyordu. Bu yüzden
+    /// ilerleme yayınını throttle ediyoruz (durum: `Self.throttleState`, kilitli).
     /// Hata alan indirmelerin bellek içi yeniden-deneme sayacı.
     private var autoRetryCountById: [String: Int] = [:]
     /// `pumpQueue` aynı anda bir kere çalışsın diye — paralel çağrılar `pumpPending`'ı set eder.
@@ -79,6 +84,53 @@ final class DownloadManager: NSObject, ObservableObject {
     private var pumpPending = false
     /// AppDelegate'in verdiği background completion handler; `urlSessionDidFinishEvents` çağırınca tetiklenir.
     var backgroundCompletionHandler: (() -> Void)?
+
+    /// URLSession delegate çağrıları için ayrı seri kuyruk.
+    /// `.main` kullanmak UI çizimiyle yarışıyor ve indirmeyi yavaşlatıyordu.
+    private static let delegateQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "com.tigeriptv.downloads.delegate"
+        q.maxConcurrentOperationCount = 1
+        q.qualityOfService = .utility
+        return q
+    }()
+
+    /// Delegate kuyruğundan (main dışı) erişilen throttle durumu — kilit ile korunur.
+    private nonisolated(unsafe) static let throttleLock = NSLock()
+    private nonisolated(unsafe) static var throttleState: [Int: (bytes: Int64, at: TimeInterval)] = [:]
+
+    /// Bekleme (stall) denetleyicisi: ilerleme durursa task'i otomatik yeniden başlatır.
+    private var watchdogTask: Task<Void, Never>?
+    /// taskIdentifier → son görülen bayt sayısı (watchdog için).
+    private var lastSeenBytes: [Int: Int64] = [:]
+    /// taskIdentifier → son ilerleme zamanı (watchdog için).
+    private var lastSeenAt: [Int: Date] = [:]
+    /// taskIdentifier → kaç kez yeniden başlatıldı.
+    private var stallRestarts: [Int: Int] = [:]
+    /// İlerleme bu süre boyunca hiç değişmezse task yeniden başlatılır.
+    private static let stallTimeout: TimeInterval = 45
+    /// Watchdog kontrol aralığı.
+    private static let watchdogInterval: TimeInterval = 10
+    /// Bir task en fazla kaç kez stall nedeniyle yeniden başlatılır.
+    private static let maxStallRestarts = 3
+
+    /// task.taskDescription içinde id ile relPath'i ayıran karakter (U+001F).
+    /// Delegate kuyruğundan (main dışı) senkron okunabilmesi için id + relPath'i
+    /// tek bir string'e paketler.
+    nonisolated private static func taskDescription(id: String, relPath: String) -> String {
+        id + downloadTaskSeparator + relPath
+    }
+
+    /// `taskDescription`'ı (id, relPath) olarak çözer.
+    nonisolated private static func parseTaskDescription(_ raw: String?) -> (id: String, relPath: String)? {
+        guard let raw else { return nil }
+        let parts = raw.split(separator: "\u{001F}", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let id = String(parts[0])
+        let relPath = String(parts[1])
+        guard !id.isEmpty, !relPath.isEmpty else { return nil }
+        return (id, relPath)
+    }
 
     override private init() {
         super.init()
@@ -95,8 +147,91 @@ final class DownloadManager: NSObject, ObservableObject {
         config.allowsConstrainedNetworkAccess = true
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 60 * 60 * 24
-        self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: Self.delegateQueue)
         Task { await restoreOutstandingTasks() }
+        startWatchdog()
+    }
+
+    // MARK: - Stall watchdog
+
+    /// İndirme sessizce takılırsa (sunucu bağlantıyı askıya aldı, CDN yönlendirmesi
+    /// yarıda kaldı vb.) hiçbir delegate çağrısı gelmez ve ilerleme donar.
+    /// Bu denetleyici ilerlemeyi izler ve gerekirse task'i yeniden başlatır.
+    private func startWatchdog() {
+        watchdogTask?.cancel()
+        watchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.watchdogInterval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                await self.checkForStalls()
+            }
+        }
+    }
+
+    private func checkForStalls() async {
+        guard !idToTask.isEmpty else { return }
+        let now = Date()
+        for (id, task) in idToTask {
+            let taskId = task.taskIdentifier
+            let received = task.countOfBytesReceived
+            let previous = lastSeenBytes[taskId]
+
+            if previous == nil {
+                lastSeenBytes[taskId] = received
+                lastSeenAt[taskId] = now
+                continue
+            }
+
+            if received != previous {
+                // İlerleme var — sayaçları tazele.
+                lastSeenBytes[taskId] = received
+                lastSeenAt[taskId] = now
+                stallRestarts[taskId] = 0
+                continue
+            }
+
+            let idleFor = now.timeIntervalSince(lastSeenAt[taskId] ?? now)
+            guard idleFor >= Self.stallTimeout else { continue }
+
+            let restarts = (stallRestarts[taskId] ?? 0) + 1
+            stallRestarts[taskId] = restarts
+            downloadLog.error("stall id=\(id, privacy: .public) idle=\(Int(idleFor), privacy: .public)s restart=\(restarts)")
+
+            if restarts > Self.maxStallRestarts {
+                // Israr eden takılma: hata olarak işaretle, kuyruk devam etsin.
+                idToTask.removeValue(forKey: id)
+                idToPlaylistId.removeValue(forKey: id)
+                taskToId.removeValue(forKey: taskId)
+                taskToRelativePath.removeValue(forKey: taskId)
+                lastSeenBytes.removeValue(forKey: taskId)
+                lastSeenAt.removeValue(forKey: taskId)
+                stallRestarts.removeValue(forKey: taskId)
+                task.cancel()
+                await markFailed(
+                    id: id,
+                    error: NSError(domain: "Download", code: -4,
+                                   userInfo: [NSLocalizedDescriptionKey: "Download stalled (no data received)"])
+                )
+                await pumpQueue()
+                continue
+            }
+
+            // Yeniden başlat: resume verisi varsa onunla, yoksa baştan.
+            let relPath = taskToRelativePath[taskId]
+            let playlistId = idToPlaylistId[id]
+            let remote = task.originalRequest?.url
+            idToTask.removeValue(forKey: id)
+            idToPlaylistId.removeValue(forKey: id)
+            taskToId.removeValue(forKey: taskId)
+            taskToRelativePath.removeValue(forKey: taskId)
+            lastSeenBytes.removeValue(forKey: taskId)
+            lastSeenAt.removeValue(forKey: taskId)
+            task.cancel()
+
+            guard let relPath, let playlistId, let remote else { continue }
+            startTask(id: id, playlistId: playlistId, remoteURL: remote, relPath: relPath)
+            dbVersion &+= 1
+        }
     }
 
     // MARK: - App lifecycle
@@ -122,6 +257,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 }
                 taskToId[downloadTask.taskIdentifier] = match.id
                 taskToRelativePath[downloadTask.taskIdentifier] = match.localPath
+                downloadTask.taskDescription = Self.taskDescription(id: match.id, relPath: match.localPath)
                 idToTask[match.id] = downloadTask
                 idToPlaylistId[match.id] = match.playlistId
                 progress[match.id] = DownloadProgress(
@@ -479,6 +615,10 @@ final class DownloadManager: NSObject, ObservableObject {
         var request = URLRequest(url: remoteURL)
         request.allowsCellularAccess = !Self.wifiOnly
         let task = session.downloadTask(with: request)
+        // Delegate kuyruğu main dışında çalıştığı için id + relPath'i task'ın
+        // kendisine yazıyoruz; delegate bunları senkron okuyabilir (MainActor'a
+        // dokunmadan). Ayırıcı: U+001F (unit separator).
+        task.taskDescription = Self.taskDescription(id: id, relPath: relPath)
         taskToId[task.taskIdentifier] = id
         taskToRelativePath[task.taskIdentifier] = relPath
         idToTask[id] = task
@@ -551,7 +691,10 @@ final class DownloadManager: NSObject, ObservableObject {
 }
 
 // MARK: - URLSessionDownloadDelegate
-// Delegate queue = main queue olarak yapılandırıldığı için main-actor state'ine direkt erişebiliriz.
+// Delegate kuyruğu ayrı bir seri OperationQueue'dur (main değil). Bu yüzden
+// delegate metotları `nonisolated`'dır; MainActor state'ine yalnızca
+// `Task { @MainActor in ... }` ile erişirler. id/relPath senkron gerektiğinde
+// `task.taskDescription` üzerinden okunur.
 
 extension DownloadManager: URLSessionDownloadDelegate {
     nonisolated func urlSession(
@@ -561,34 +704,45 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        MainActor.assumeIsolated {
-            let taskId = downloadTask.taskIdentifier
-            guard let id = self.taskToId[taskId] else { return }
+        let taskId = downloadTask.taskIdentifier
+        guard let (id, _) = Self.parseTaskDescription(downloadTask.taskDescription) else { return }
 
-            // İlerlemeyi throttle et: her chunk'ta UI'yı yeniden çizmek main thread'i
-            // doldurup indirmeyi yavaşlatıyordu. 0.2 sn'de bir yayınla.
-            let now = Date.timeIntervalSinceReferenceDate
-            let last = self.lastProgressPublish[taskId]
-            let isFinal = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
-            if isFinal || last == nil || (now - last!.at) >= Self.progressPublishInterval {
-                // Anlık hız: son ölçümden bu yana inen bayt / geçen süre.
-                var speed: Double = 0
-                if let last, now > last.at {
-                    let delta = Double(totalBytesWritten - last.bytes)
-                    if delta > 0 { speed = delta / (now - last.at) }
-                }
-                self.lastProgressPublish[taskId] = (totalBytesWritten, now)
-                self.progress[id] = DownloadProgress(
-                    totalBytes: max(0, totalBytesExpectedToWrite),
-                    downloadedBytes: max(0, totalBytesWritten),
+        // Throttle kararı main dışında (delegate kuyruğunda) verilir — kilitli static
+        // durum sayesinde MainActor'a dokunmadan hızlıca hesaplanır.
+        let now = Date.timeIntervalSinceReferenceDate
+        Self.throttleLock.lock()
+        let last = Self.throttleState[taskId]
+        let isFinal = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
+        var shouldPublish = false
+        var speed: Double = 0
+        if isFinal || last == nil || (now - (last?.at ?? 0)) >= downloadProgressPublishInterval {
+            if let last, now > last.at {
+                let delta = Double(totalBytesWritten - last.bytes)
+                if delta > 0 { speed = delta / (now - last.at) }
+            }
+            Self.throttleState[taskId] = (totalBytesWritten, now)
+            shouldPublish = true
+        }
+        Self.throttleLock.unlock()
+
+        let expected = totalBytesExpectedToWrite
+        let written = totalBytesWritten
+
+        if shouldPublish {
+            Task { @MainActor [weak self] in
+                self?.progress[id] = DownloadProgress(
+                    totalBytes: max(0, expected),
+                    downloadedBytes: max(0, written),
                     bytesPerSecond: max(0, speed)
                 )
             }
+        }
 
-            if totalBytesExpectedToWrite > 0,
-               !self.totalBytesPersistedFor.contains(taskId) {
+        if expected > 0 {
+            Task { @MainActor [weak self] in
+                guard let self, !self.totalBytesPersistedFor.contains(taskId) else { return }
                 self.totalBytesPersistedFor.insert(taskId)
-                let total = totalBytesExpectedToWrite
+                let total = expected
                 Task {
                     _ = try? await AppDatabase.shared.write { db in
                         if var row = try DBDownloadedItem.filter(Column("id") == id).fetchOne(db) {
@@ -607,11 +761,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         // Dosya bu delegate metodu dönünce silinir; SENKRON taşımak zorundayız.
-        let (id, relPath) = MainActor.assumeIsolated { () -> (String?, String?) in
-            let taskId = downloadTask.taskIdentifier
-            return (self.taskToId[taskId], self.taskToRelativePath[taskId])
-        }
-        guard let id, let relPath else { return }
+        // id + relPath task'ın kendisinden (taskDescription) okunur — MainActor'a
+        // dokunmadan, delegate kuyruğunda güvenle.
+        guard let (id, relPath) = Self.parseTaskDescription(downloadTask.taskDescription) else { return }
 
         let fm = FileManager.default
         let sourceSize: Int64 = {
@@ -619,12 +771,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
             return (attrs[.size] as? Int64) ?? 0
         }()
         guard sourceSize > 0 else {
-            MainActor.assumeIsolated {
-                Task { await self.markFailed(
+            Task { @MainActor [weak self] in
+                await self?.markFailed(
                     id: id,
                     error: NSError(domain: "Download", code: -1,
                                    userInfo: [NSLocalizedDescriptionKey: "Empty download payload"])
-                ) }
+                )
             }
             return
         }
@@ -636,14 +788,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
             try fm.moveItem(at: location, to: destination)
         } catch {
-            MainActor.assumeIsolated {
-                Task { await self.markFailed(id: id, error: error) }
+            Task { @MainActor [weak self] in
+                await self?.markFailed(id: id, error: error)
             }
             return
         }
 
-        MainActor.assumeIsolated {
-            Task { await self.markCompleted(id: id, fallbackSize: sourceSize) }
+        Task { @MainActor [weak self] in
+            await self?.markCompleted(id: id, fallbackSize: sourceSize)
         }
     }
 
@@ -652,10 +804,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        MainActor.assumeIsolated {
-            let taskId = task.taskIdentifier
+        let taskId = task.taskIdentifier
+        Self.throttleLock.lock()
+        Self.throttleState.removeValue(forKey: taskId)
+        Self.throttleLock.unlock()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             self.totalBytesPersistedFor.remove(taskId)
-            self.lastProgressPublish.removeValue(forKey: taskId)
             guard let id = self.taskToId[taskId] else { return }
             self.taskToId.removeValue(forKey: taskId)
             self.taskToRelativePath.removeValue(forKey: taskId)
@@ -672,27 +828,24 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 self.autoRetryCountById[id] = attempts
                 if attempts <= Self.maxAutoRetries {
                     downloadLog.info("retry id=\(id, privacy: .public) attempt=\(attempts) — kuyruğun sonuna eklendi: \(error.localizedDescription, privacy: .public)")
-                    Task {
-                        await self.requeueAfterError(id: id, errorMessage: error.localizedDescription)
-                        await self.pumpQueue()
-                    }
+                    await self.requeueAfterError(id: id, errorMessage: error.localizedDescription)
+                    await self.pumpQueue()
                 } else {
                     self.autoRetryCountById.removeValue(forKey: id)
-                    Task {
-                        await self.markFailed(id: id, error: error)
-                        await self.pumpQueue()
-                    }
+                    await self.markFailed(id: id, error: error)
+                    await self.pumpQueue()
                 }
             } else {
                 // Başarılı tamamlanma: markCompleted didFinishDownloadingTo'da çağrıldı.
                 self.autoRetryCountById.removeValue(forKey: id)
-                Task { await self.pumpQueue() }
+                await self.pumpQueue()
             }
         }
     }
 
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        MainActor.assumeIsolated {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             let handler = self.backgroundCompletionHandler
             self.backgroundCompletionHandler = nil
             handler?()
