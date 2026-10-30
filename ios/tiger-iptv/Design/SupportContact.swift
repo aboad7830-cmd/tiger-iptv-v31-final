@@ -13,11 +13,11 @@ import UIKit
 
 enum TigerSupport {
     /// Direct WhatsApp chat link (short link, works on iOS and the web).
-    static let whatsappURL = URL(string: "https://wa.me/message/D4EFHIZKUID5P1")!
+    static let whatsappURL = URL(string: "https://wa.me/919154347808")!
     /// Human readable number, kept in sync with the WhatsApp account above.
-    static let phoneNumber = "+966 56 259 6352"
+    static let phoneNumber = "+91 91 5434 780 8"
     /// Dialable form (no spaces) used for `tel:` links.
-    static let phoneDial = "+966562596352"
+    static let phoneDial = "+919154347808"
     static let phoneURL = URL(string: "tel://\(phoneDial)")!
     static let emailURL = URL(string: "mailto:support@tiger-iptv.com")!
 }
