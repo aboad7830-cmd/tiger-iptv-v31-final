@@ -12,6 +12,12 @@ private let downloadLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "app
 struct DownloadProgress: Equatable {
     let totalBytes: Int64
     let downloadedBytes: Int64
+    /// Anlık hız (bayt/saniye). 0 ise bilinmiyor.
+    var bytesPerSecond: Double = 0
+    /// Sunucu `Content-Length` göndermediyse (Xtream/M3U akışlarında çok yaygın)
+    /// `totalBytes == 0` olur. Bu durumda yüzde hesaplanamaz — UI ilerlemeyi
+    /// indirilen boyut üzerinden göstermeli, aksi halde sonsuza dek %0 görünür.
+    var hasKnownTotal: Bool { totalBytes > 0 }
     var fraction: Double {
         guard totalBytes > 0 else { return 0 }
         return min(1.0, Double(downloadedBytes) / Double(totalBytes))
@@ -565,10 +571,17 @@ extension DownloadManager: URLSessionDownloadDelegate {
             let last = self.lastProgressPublish[taskId]
             let isFinal = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
             if isFinal || last == nil || (now - last!.at) >= Self.progressPublishInterval {
+                // Anlık hız: son ölçümden bu yana inen bayt / geçen süre.
+                var speed: Double = 0
+                if let last, now > last.at {
+                    let delta = Double(totalBytesWritten - last.bytes)
+                    if delta > 0 { speed = delta / (now - last.at) }
+                }
                 self.lastProgressPublish[taskId] = (totalBytesWritten, now)
                 self.progress[id] = DownloadProgress(
                     totalBytes: max(0, totalBytesExpectedToWrite),
-                    downloadedBytes: max(0, totalBytesWritten)
+                    downloadedBytes: max(0, totalBytesWritten),
+                    bytesPerSecond: max(0, speed)
                 )
             }
 

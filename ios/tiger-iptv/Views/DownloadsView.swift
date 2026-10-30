@@ -260,16 +260,38 @@ struct DownloadsView: View {
         switch item.downloadStatus {
         case .downloading:
             let p = manager.progress[item.id]
-            let fraction = p?.fraction ?? 0
             VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: fraction)
-                    .progressViewStyle(.linear)
-                HStack {
-                    Text(L("download.downloading_format", Int(fraction * 100)))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                    if let p, p.totalBytes > 0 {
+                if let p, p.hasKnownTotal {
+                    ProgressView(value: p.fraction)
+                        .progressViewStyle(.linear)
+                } else {
+                    // Sunucu Content-Length göndermediyse yüzde hesaplanamaz.
+                    // Belirsiz (indeterminate) çubuk göster — %0'da donmuş görünmesin.
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                }
+                HStack(spacing: 6) {
+                    if let p, p.hasKnownTotal {
+                        Text(L("download.downloading_format", Int(p.fraction * 100)))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    } else {
+                        Text(ByteCountFormatter.string(fromByteCount: p?.downloadedBytes ?? 0, countStyle: .file))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    if let p, p.bytesPerSecond > 0 {
+                        Text(verbatim: "•")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(Self.speedText(p.bytesPerSecond))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    if let p, p.hasKnownTotal {
                         Text(ByteCountFormatter.string(fromByteCount: p.totalBytes, countStyle: .file))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -290,6 +312,17 @@ struct DownloadsView: View {
                 .foregroundStyle(.red)
                 .lineLimit(2)
         }
+    }
+
+    /// İndirme hızını "1.2 MB/s" biçiminde gösterir.
+    private static func speedText(_ bytesPerSecond: Double) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useKB, .useMB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        let value = formatter.string(fromByteCount: Int64(max(0, bytesPerSecond)))
+        return value + "/s"
     }
 
     private func play(_ item: DBDownloadedItem) {
