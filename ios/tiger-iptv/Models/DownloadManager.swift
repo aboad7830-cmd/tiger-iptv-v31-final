@@ -1056,7 +1056,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         _ = try? await AppDatabase.shared.write { db in
             if var row = try DBDownloadedItem.filter(Column("id") == id).fetchOne(db) {
                 // Tamamlanmış bir satırı asla kuyruğa geri düşürme.
-                guard row.downloadStatus != DownloadStatus.completed.rawValue else { return }
+                guard row.downloadStatus != .completed else { return }
                 row.status = DownloadStatus.queued.rawValue
                 row.errorMessage = errorMessage
                 row.createdAt = Date()
