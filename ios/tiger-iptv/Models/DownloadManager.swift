@@ -8,6 +8,12 @@ import UserNotifications
 
 private let downloadLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "app", category: "Downloads")
 
+/// taskIdentifier → indirme satırı eşlemesi (delegate kuyruğundan senkron okunur).
+private struct DownloadTaskMeta: Sendable {
+    let id: String
+    let relPath: String
+}
+
 /// İlerleme yayın aralığı (saniye). 0.2 sn ≈ saniyede 5 güncelleme — akıcı ve hafif.
 /// Global sabit: delegate kuyruğundan (main dışı) güvenle okunur.
 private let downloadProgressPublishInterval: TimeInterval = 0.2
@@ -78,6 +84,9 @@ final class DownloadManager: NSObject, ObservableObject {
     /// ilerleme yayınını throttle ediyoruz (durum: `Self.throttleState`, kilitli).
     /// Hata alan indirmelerin bellek içi yeniden-deneme sayacı.
     private var autoRetryCountById: [String: Int] = [:]
+    /// Hata sonrası URLSession'ın verdiği resume data — yeniden başlatırken
+    /// sıfırdan indirmek yerine kaldığı yerden devam etmek için.
+    private var resumeDataById: [String: Data] = [:]
     /// `pumpQueue` aynı anda bir kere çalışsın diye — paralel çağrılar `pumpPending`'ı set eder.
     private var pumpInFlight = false
     /// Pump çalışırken başka bir pump tetiklendiyse, mevcut pump bitmeden önce bir kez daha döner.
@@ -98,6 +107,33 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Delegate kuyruğundan (main dışı) erişilen throttle durumu — kilit ile korunur.
     private nonisolated(unsafe) static let throttleLock = NSLock()
     private nonisolated(unsafe) static var throttleState: [Int: (bytes: Int64, at: TimeInterval)] = [:]
+
+    /// taskIdentifier → (id, relPath). Delegate kuyruğu main dışında çalıştığı için
+    /// bu eşleme kilitli static bir sözlükte tutulur; böylece `didFinishDownloadingTo`
+    /// MainActor'a hiç dokunmadan (ve uygulama yeniden açıldığında `taskDescription`
+    /// kaybolsa bile) doğru satırı bulur.
+    nonisolated(unsafe) private static let metaLock = NSLock()
+    nonisolated(unsafe) private static var metaByTask: [Int: DownloadTaskMeta] = [:]
+
+    nonisolated private static func setMeta(_ meta: DownloadTaskMeta, for taskId: Int) {
+        metaLock.lock(); metaByTask[taskId] = meta; metaLock.unlock()
+    }
+    nonisolated private static func meta(for taskId: Int) -> DownloadTaskMeta? {
+        metaLock.lock(); defer { metaLock.unlock() }; return metaByTask[taskId]
+    }
+    nonisolated private static func clearMeta(for taskId: Int) {
+        metaLock.lock(); metaByTask.removeValue(forKey: taskId); metaLock.unlock()
+    }
+    /// taskDescription'dan okumayı dener, olmazsa kilitli sözlükten okur.
+    nonisolated private static func resolveMeta(for task: URLSessionTask) -> DownloadTaskMeta? {
+        if let m = meta(for: task.taskIdentifier) { return m }
+        if let parsed = parseTaskDescription(task.taskDescription) {
+            let m = DownloadTaskMeta(id: parsed.id, relPath: parsed.relPath)
+            setMeta(m, for: task.taskIdentifier)
+            return m
+        }
+        return nil
+    }
 
     /// Bekleme (stall) denetleyicisi: ilerleme durursa task'i otomatik yeniden başlatır.
     private var watchdogTask: Task<Void, Never>?
@@ -258,6 +294,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 taskToId[downloadTask.taskIdentifier] = match.id
                 taskToRelativePath[downloadTask.taskIdentifier] = match.localPath
                 downloadTask.taskDescription = Self.taskDescription(id: match.id, relPath: match.localPath)
+                Self.setMeta(DownloadTaskMeta(id: match.id, relPath: match.localPath), for: downloadTask.taskIdentifier)
                 idToTask[match.id] = downloadTask
                 idToPlaylistId[match.id] = match.playlistId
                 progress[match.id] = DownloadProgress(
@@ -273,19 +310,56 @@ final class DownloadManager: NSObject, ObservableObject {
         // createdAt DEĞİŞTİRİLMEZ ki kullanıcının orjinal sırası korunsun.
         let orphans = downloadingRows.filter { !matchedIds.contains($0.id) }
         if !orphans.isEmpty {
+            // Dosya diskte zaten tam inmiş olabilir (uygulama tam %100'de
+            // kapatıldıysa). Öyleyse yeniden indirmek yerine tamamlandı say.
+            var recovered: Set<String> = []
+            var toQueue: [String] = []
+            for orphan in orphans {
+                // 1) Kurtarma klasöründe bu URL'ye ait tam inmiş dosya var mı?
+                //    (uygulama %100'de kapatıldı / arka planda uyandırıldı)
+                let pendingSize = DownloadStorage.takePendingFile(
+                    forRemoteURL: orphan.remoteURL,
+                    to: orphan.localPath
+                )
+                // 2) Yoksa hedef dosya diskte dolu mu?
+                let size: Int64 = pendingSize ?? {
+                    guard let url = try? DownloadStorage.absoluteURL(forRelativePath: orphan.localPath),
+                          let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                          let s = attrs[.size] as? Int64 else { return 0 }
+                    return s
+                }()
+                if size > 0 {
+                    recovered.insert(orphan.id)
+                    downloadLog.info("restore recovered id=\(orphan.id, privacy: .public) size=\(size, privacy: .public) — dosya zaten tam")
+                } else {
+                    toQueue.append(orphan.id)
+                }
+            }
             _ = try? await AppDatabase.shared.write { db in
                 for orphan in orphans {
                     if var row = try DBDownloadedItem.filter(Column("id") == orphan.id).fetchOne(db) {
-                        row.status = DownloadStatus.queued.rawValue
-                        row.errorMessage = nil
-                        row.totalBytes = 0
-                        row.downloadedBytes = 0
+                        if recovered.contains(orphan.id) {
+                            let size: Int64 = {
+                                guard let url = try? DownloadStorage.absoluteURL(forRelativePath: row.localPath),
+                                      let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                                      let s = attrs[.size] as? Int64 else { return 0 }
+                                return s
+                            }()
+                            row.status = DownloadStatus.completed.rawValue
+                            row.completedAt = Date()
+                            row.totalBytes = Int(size)
+                            row.downloadedBytes = Int(size)
+                            row.errorMessage = nil
+                        } else {
+                            row.status = DownloadStatus.queued.rawValue
+                            row.errorMessage = nil
+                        }
                         try row.update(db)
                     }
                 }
             }
-            for orphan in orphans {
-                downloadLog.info("restore orphan id=\(orphan.id, privacy: .public) — DB downloading, task yok; kuyruğa geri alındı")
+            for id in toQueue {
+                downloadLog.info("restore orphan id=\(id, privacy: .public) — DB downloading, task yok; kuyruğa geri alındı")
             }
             dbVersion &+= 1
         }
@@ -315,9 +389,13 @@ final class DownloadManager: NSObject, ObservableObject {
         enqueueInFlight.insert(id)
         defer { enqueueInFlight.remove(id) }
         autoRetryCountById.removeValue(forKey: id)
+        resumeDataById.removeValue(forKey: id)
 
         let ext = containerExtension ?? "mp4"
         let relPath = DownloadStorage.relativePath(playlistId: playlistId, type: type, streamId: streamId, ext: ext)
+        // Yeniden indirmede eski/yarım dosya kalmasın — aksi halde "zaten indi"
+        // sanılıp hatalı tamamlanabilir.
+        DownloadStorage.removeFile(relativePath: relPath)
 
         // حدّ التخزين (f130): يمنع بدء تنزيل جديد عند تجاوز السقف المحدد.
         if TigerFeatureRuntime.shared.isOn("f130") {
@@ -400,6 +478,7 @@ final class DownloadManager: NSObject, ObservableObject {
         idToPlaylistId.removeValue(forKey: id)
         progress.removeValue(forKey: id)
         autoRetryCountById.removeValue(forKey: id)
+        resumeDataById.removeValue(forKey: id)
         Task { [id] in
             await self.deleteRow(id: id, removeFile: true)
             if hadActiveTask { await self.pumpQueue() }
@@ -417,6 +496,7 @@ final class DownloadManager: NSObject, ObservableObject {
         idToPlaylistId.removeValue(forKey: id)
         progress.removeValue(forKey: id)
         autoRetryCountById.removeValue(forKey: id)
+        resumeDataById.removeValue(forKey: id)
         await deleteRow(id: id, removeFile: true)
         if hadActiveTask { await pumpQueue() }
     }
@@ -437,6 +517,7 @@ final class DownloadManager: NSObject, ObservableObject {
             idToPlaylistId.removeValue(forKey: id)
             progress.removeValue(forKey: id)
             autoRetryCountById.removeValue(forKey: id)
+            resumeDataById.removeValue(forKey: id)
         }
         DownloadStorage.removePlaylistDirectory(playlistId: playlistId)
         dbVersion &+= 1
@@ -474,6 +555,7 @@ final class DownloadManager: NSObject, ObservableObject {
             idToPlaylistId.removeValue(forKey: id)
             progress.removeValue(forKey: id)
             autoRetryCountById.removeValue(forKey: id)
+            resumeDataById.removeValue(forKey: id)
         }
         // DB row'ları (bu playlist'e ait olanlar) ve dosyalar
         let rows: [DBDownloadedItem] = (try? await AppDatabase.shared.read { db in
@@ -481,6 +563,7 @@ final class DownloadManager: NSObject, ObservableObject {
         }) ?? []
         for row in rows {
             DownloadStorage.removeFile(relativePath: row.localPath)
+            DownloadStorage.removePendingFile(forRemoteURL: row.remoteURL)
         }
         // Playlist klasörünü tamamen kaldır (subdir + olası boş klasörler).
         DownloadStorage.removePlaylistDirectory(playlistId: playlistId)
@@ -501,6 +584,7 @@ final class DownloadManager: NSObject, ObservableObject {
         idToTask.removeAll()
         idToPlaylistId.removeAll()
         autoRetryCountById.removeAll()
+        resumeDataById.removeAll()
 
         let all: [DBDownloadedItem] = (try? await AppDatabase.shared.read { db in
             try DBDownloadedItem.fetchAll(db)
@@ -508,6 +592,8 @@ final class DownloadManager: NSObject, ObservableObject {
         for row in all {
             DownloadStorage.removeFile(relativePath: row.localPath)
         }
+        // Kurtarma klasöründe bekleyen dosyalar da temizlenir.
+        DownloadStorage.clearPendingFiles()
         _ = try? await AppDatabase.shared.write { db in
             try DBDownloadedItem.deleteAll(db)
         }
@@ -597,6 +683,26 @@ final class DownloadManager: NSObject, ObservableObject {
                     continue
                 }
 
+                // GÜVENLİK AĞI 1: kurtarma klasöründe bu URL'ye ait tam inmiş
+                // dosya varsa yerine taşı, yeniden indirme.
+                if let recoveredSize = DownloadStorage.takePendingFile(
+                    forRemoteURL: next.remoteURL,
+                    to: next.localPath
+                ) {
+                    downloadLog.info("pumpQueue id=\(next.id, privacy: .public) — kurtarma dosyası bulundu (\(recoveredSize) bayt)")
+                    await markCompleted(id: next.id, fallbackSize: recoveredSize)
+                    continue
+                }
+
+                // GÜVENLİK AĞI 2: dosya diskte zaten tam ise (satır yanlışlıkla
+                // kuyruğa düştüyse) yeniden indirme — doğrudan tamamlandı say.
+                // Aksi hâlde "%100 oldu, baştan indiriyor" durumu yaşanır.
+                if let size = Self.existingFileSize(relativePath: next.localPath), size > 0 {
+                    downloadLog.info("pumpQueue id=\(next.id, privacy: .public) — dosya zaten tam (\(size) bayt), yeniden indirilmiyor")
+                    await markCompleted(id: next.id, fallbackSize: size)
+                    continue
+                }
+
                 _ = try? await AppDatabase.shared.write { db in
                     if var row = try DBDownloadedItem.filter(Column("id") == next.id).fetchOne(db) {
                         row.status = DownloadStatus.downloading.rawValue
@@ -612,18 +718,28 @@ final class DownloadManager: NSObject, ObservableObject {
     /// DB row'u zaten var kabul edilir. URLSession task'ini kurar ve bellek içi haritalara yazar.
     private func startTask(id: String, playlistId: UUID, remoteURL: URL, relPath: String) {
         downloadLog.info("start id=\(id, privacy: .public) playlist=\(playlistId.uuidString, privacy: .public) url=\(remoteURL.absoluteString, privacy: .public)")
-        var request = URLRequest(url: remoteURL)
-        request.allowsCellularAccess = !Self.wifiOnly
-        let task = session.downloadTask(with: request)
+        let task: URLSessionDownloadTask
+        // Yarım kalan bir indirme varsa resume data ile devam et — sıfırdan indirme.
+        if let resumeData = resumeDataById[id] {
+            task = session.downloadTask(withResumeData: resumeData)
+            downloadLog.info("resume id=\(id, privacy: .public) — kaldığı yerden devam")
+        } else {
+            var request = URLRequest(url: remoteURL)
+            request.allowsCellularAccess = !Self.wifiOnly
+            task = session.downloadTask(with: request)
+        }
         // Delegate kuyruğu main dışında çalıştığı için id + relPath'i task'ın
-        // kendisine yazıyoruz; delegate bunları senkron okuyabilir (MainActor'a
-        // dokunmadan). Ayırıcı: U+001F (unit separator).
+        // kendisine ve kilitli sözlüğe yazıyoruz; delegate senkron okuyabilir.
         task.taskDescription = Self.taskDescription(id: id, relPath: relPath)
+        Self.setMeta(DownloadTaskMeta(id: id, relPath: relPath), for: task.taskIdentifier)
         taskToId[task.taskIdentifier] = id
         taskToRelativePath[task.taskIdentifier] = relPath
         idToTask[id] = task
         idToPlaylistId[id] = playlistId
-        progress[id] = DownloadProgress(totalBytes: 0, downloadedBytes: 0)
+        // Resume data kullanıldıysa ilerlemeyi sıfırlamayalım (UI 0'a düşmesin).
+        if progress[id] == nil {
+            progress[id] = DownloadProgress(totalBytes: 0, downloadedBytes: 0)
+        }
         task.resume()
     }
 
@@ -636,6 +752,9 @@ final class DownloadManager: NSObject, ObservableObject {
             }
             if removeFile, let relPath = existing?.localPath {
                 DownloadStorage.removeFile(relativePath: relPath)
+            }
+            if let remote = existing?.remoteURL {
+                DownloadStorage.removePendingFile(forRemoteURL: remote)
             }
             _ = try await AppDatabase.shared.write { db in
                 try DBDownloadedItem.filter(Column("id") == id).deleteAll(db)
@@ -705,7 +824,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesExpectedToWrite: Int64
     ) {
         let taskId = downloadTask.taskIdentifier
-        guard let (id, _) = Self.parseTaskDescription(downloadTask.taskDescription) else { return }
+        guard let meta = Self.resolveMeta(for: downloadTask) else { return }
+        let id = meta.id
 
         // Throttle kararı main dışında (delegate kuyruğunda) verilir — kilitli static
         // durum sayesinde MainActor'a dokunmadan hızlıca hesaplanır.
@@ -761,9 +881,23 @@ extension DownloadManager: URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         // Dosya bu delegate metodu dönünce silinir; SENKRON taşımak zorundayız.
-        // id + relPath task'ın kendisinden (taskDescription) okunur — MainActor'a
-        // dokunmadan, delegate kuyruğunda güvenle.
-        guard let (id, relPath) = Self.parseTaskDescription(downloadTask.taskDescription) else { return }
+        // id + relPath task'ın kendisinden (taskDescription) ya da kilitli sözlükten
+        // okunur — MainActor'a dokunmadan, delegate kuyruğunda güvenle.
+        guard let meta = Self.resolveMeta(for: downloadTask) else {
+            // Uygulama arka planda uyandırıldığında delegate, DB geri yüklemesi
+            // tamamlanmadan çalışabilir → satır henüz eşleşmemiş olur. Bu durumda
+            // %100 inmiş dosyayı ASLA çöpe atmayız: kurtarma klasörüne koyarız,
+            // `restoreOutstandingTasks` bir sonraki açılışta yerine taşır.
+            let remote = downloadTask.originalRequest?.url?.absoluteString ?? ""
+            if !remote.isEmpty, DownloadStorage.storePendingFile(from: location, remoteURL: remote) {
+                downloadLog.info("didFinish: eşleşmeyen task → kurtarma klasörüne alındı (\(remote, privacy: .public))")
+            } else {
+                downloadLog.error("didFinish: eşleşmeyen task ve kurtarma başarısız (\(remote, privacy: .public))")
+            }
+            return
+        }
+        let id = meta.id
+        let relPath = meta.relPath
 
         let fm = FileManager.default
         let sourceSize: Int64 = {
@@ -808,6 +942,15 @@ extension DownloadManager: URLSessionDownloadDelegate {
         Self.throttleLock.lock()
         Self.throttleState.removeValue(forKey: taskId)
         Self.throttleLock.unlock()
+        Self.clearMeta(for: taskId)
+
+        // Resume data varsa sakla — sonraki denemede sıfırdan değil, kaldığı
+        // yerden devam edilsin. (Büyük bölümlerde bu kritik.)
+        var resumeData: Data?
+        if let ns = error as NSError?,
+           let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+            resumeData = data
+        }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -824,23 +967,78 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled {
                     return
                 }
+
+                // KRİTİK: Dosya zaten %100 inip `markCompleted` ile tamamlandıysa,
+                // URLSession'ın geç gelen hatası (bağlantı koptu vb.) yüzünden
+                // indirmeyi SIFIRDAN tekrar başlatmayalım. Satır `completed` ise
+                // ya da hedef dosya diskte doluysa hatayı yok say.
+                if await self.isAlreadyCompleted(id: id) {
+                    downloadLog.info("ignore late error id=\(id, privacy: .public) — zaten tamamlandı: \(error.localizedDescription, privacy: .public)")
+                    self.autoRetryCountById.removeValue(forKey: id)
+                    self.resumeDataById.removeValue(forKey: id)
+                    await self.pumpQueue()
+                    return
+                }
+
                 let attempts = (self.autoRetryCountById[id] ?? 0) + 1
                 self.autoRetryCountById[id] = attempts
                 if attempts <= Self.maxAutoRetries {
                     downloadLog.info("retry id=\(id, privacy: .public) attempt=\(attempts) — kuyruğun sonuna eklendi: \(error.localizedDescription, privacy: .public)")
+                    // Resume data'yı yalnızca ilk denemede kullan; ikinci denemede
+                    // hâlâ hata varsa sunucu range desteklemiyor olabilir → temiz başla.
+                    if attempts >= 2 {
+                        self.resumeDataById.removeValue(forKey: id)
+                    } else if let resumeData {
+                        self.resumeDataById[id] = resumeData
+                    }
                     await self.requeueAfterError(id: id, errorMessage: error.localizedDescription)
                     await self.pumpQueue()
                 } else {
                     self.autoRetryCountById.removeValue(forKey: id)
+                    self.resumeDataById.removeValue(forKey: id)
                     await self.markFailed(id: id, error: error)
                     await self.pumpQueue()
                 }
             } else {
                 // Başarılı tamamlanma: markCompleted didFinishDownloadingTo'da çağrıldı.
                 self.autoRetryCountById.removeValue(forKey: id)
+                self.resumeDataById.removeValue(forKey: id)
                 await self.pumpQueue()
             }
         }
+    }
+
+    /// Hedef dosya diskte varsa bayt cinsinden boyutu, yoksa nil.
+    private static func existingFileSize(relativePath: String) -> Int64? {
+        guard let url = try? DownloadStorage.absoluteURL(forRelativePath: relativePath),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64,
+              size > 0 else {
+            return nil
+        }
+        return size
+    }
+
+    /// Satır `completed` mi ya da hedef dosya diskte gerçekten dolu mu?
+    /// Geç gelen URLSession hatalarında yeniden indirmeyi engellemek için kullanılır.
+    private func isAlreadyCompleted(id: String) async -> Bool {
+        let row: DBDownloadedItem? = try? await AppDatabase.shared.read { db in
+            try DBDownloadedItem.filter(Column("id") == id).fetchOne(db)
+        }
+        guard let row else { return false }
+        if row.downloadStatus == .completed { return true }
+        // Durum henüz güncellenmemiş olabilir (markCompleted async) — dosyaya bak.
+        //
+        // ÖNEMLİ: URLSession hedef dosyayı yalnızca `didFinishDownloadingTo`
+        // içinde (yani indirme BAŞARIYLA bittiğinde) taşır. Dolayısıyla hedef
+        // yolda 0'dan büyük bir dosya varsa indirme tamamlanmıştır. Sunucunun
+        // bildirdiği Content-Length gerçek boyuttan farklı olabileceği için
+        // boyut karşılaştırması yapmıyoruz — aksi hâlde "%100 oldu, baştan
+        // indiriyor" hatası oluşuyordu.
+        if let size = Self.existingFileSize(relativePath: row.localPath), size > 0 {
+            return true
+        }
+        return false
     }
 
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -857,10 +1055,10 @@ extension DownloadManager: URLSessionDownloadDelegate {
     private func requeueAfterError(id: String, errorMessage: String) async {
         _ = try? await AppDatabase.shared.write { db in
             if var row = try DBDownloadedItem.filter(Column("id") == id).fetchOne(db) {
+                // Tamamlanmış bir satırı asla kuyruğa geri düşürme.
+                guard row.downloadStatus != DownloadStatus.completed.rawValue else { return }
                 row.status = DownloadStatus.queued.rawValue
                 row.errorMessage = errorMessage
-                row.totalBytes = 0
-                row.downloadedBytes = 0
                 row.createdAt = Date()
                 try row.update(db)
             }
@@ -871,13 +1069,23 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
     private func markCompleted(id: String, fallbackSize: Int64 = 0) async {
         let now = Date()
-        let row: DBDownloadedItem? = try? await AppDatabase.shared.read { db in
-            try DBDownloadedItem.filter(Column("id") == id).fetchOne(db)
+        // DB okuması nadiren de olsa kilitli olabilir — birkaç kez dene,
+        // aksi halde satır sonsuza dek "downloading" kalırdı.
+        var row: DBDownloadedItem?
+        for attempt in 0..<3 {
+            row = try? await AppDatabase.shared.read { db in
+                try DBDownloadedItem.filter(Column("id") == id).fetchOne(db)
+            }
+            if row != nil { break }
+            if attempt < 2 { try? await Task.sleep(nanoseconds: 150_000_000) }
         }
         guard let row else {
+            downloadLog.error("markCompleted id=\(id, privacy: .public) — DB satırı okunamadı")
             progress.removeValue(forKey: id)
             return
         }
+        // Zaten tamamlandıysa tekrar yazma (idempotent).
+        if row.downloadStatus == .completed { progress.removeValue(forKey: id); return }
         let actualSize: Int64 = {
             guard let url = try? DownloadStorage.absoluteURL(forRelativePath: row.localPath),
                   let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else {

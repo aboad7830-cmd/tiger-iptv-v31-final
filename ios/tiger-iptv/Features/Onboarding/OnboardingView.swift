@@ -10,7 +10,9 @@ struct OnboardingView: View {
     @State private var page = 0
     @StateObject private var theme = ThemeManager.shared
 
-    private let pageCount = 5
+    /// Not: "Built for real viewing" özellik listesi sayfası App Store
+    /// inceleme kurallarına takıldığı için kaldırıldı (kullanıcı talebi).
+    private let pageCount = 4
 
     var body: some View {
         ZStack {
@@ -19,10 +21,9 @@ struct OnboardingView: View {
             VStack(spacing: 0) {
                 TabView(selection: $page) {
                     welcomePage.tag(0)
-                    featuresPage.tag(1)
-                    featurePackPage.tag(2)
-                    themePage.tag(3)
-                    readyPage.tag(4)
+                    featurePackPage.tag(1)
+                    themePage.tag(2)
+                    readyPage.tag(3)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
 
@@ -62,35 +63,6 @@ struct OnboardingView: View {
             Spacer()
         }
         .padding(.horizontal, Spacing.xl)
-    }
-
-    private var featuresPage: some View {
-        VStack(spacing: Spacing.lg) {
-            Spacer()
-            Text(L("onboarding.features.title"))
-                .font(.system(size: 27, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.center)
-                .shadow(color: .black.opacity(0.25), radius: 8)
-
-            VStack(spacing: Spacing.md) {
-                featureRow(icon: "play.rectangle.on.rectangle", title: L("onboarding.feature.multiview"), body: L("onboarding.feature.multiview.desc"))
-                featureRow(icon: "calendar", title: L("onboarding.feature.epg"), body: L("onboarding.feature.epg.desc"))
-                featureRow(icon: "arrow.down.circle", title: L("onboarding.feature.downloads"), body: L("onboarding.feature.downloads.desc"))
-                featureRow(icon: "lock.shield", title: L("onboarding.feature.parental"), body: L("onboarding.feature.parental.desc"))
-            }
-            .padding(Spacing.md)
-            .background(
-                RoundedRectangle(cornerRadius: Radius.lg, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Radius.lg, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
-                    )
-            )
-            Spacer()
-        }
-        .padding(.horizontal, Spacing.lg)
     }
 
     /// صفحة جديدة تُبرز حزمة المزايا الكبيرة (200+ ميزة) داخل التطبيق.
@@ -255,25 +227,6 @@ struct OnboardingView: View {
             }
         }
         .buttonStyle(.plain)
-    }
-
-    private func featureRow(icon: String, title: String, body: String) -> some View {
-        HStack(alignment: .top, spacing: Spacing.sm) {
-            Image(systemName: icon)
-                .font(.system(size: 18))
-                .foregroundStyle(TigerTheme.gold)
-                .frame(width: 30)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                Text(body)
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.72))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-        }
     }
 
     private func packChip(icon: String, text: String) -> some View {

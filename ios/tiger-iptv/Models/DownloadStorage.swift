@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// İndirilen medya dosyaları için cihaz üzerinde path yönetir.
 /// Application Support/Downloads altında tutulur — Caches gibi iOS tarafından silinmez,
@@ -64,6 +65,77 @@ enum DownloadStorage {
     static func removeFile(relativePath: String) {
         guard let url = try? absoluteURL(forRelativePath: relativePath) else { return }
         try? FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: - Pending (kurtarma) dosyaları
+
+    /// Delegate, indirmenin hangi satıra ait olduğunu henüz bilmiyorsa (uygulama
+    /// arka planda uyandırıldığında DB geri yüklemesi bitmeden `didFinishDownloadingTo`
+    /// çağrılabilir) dosyayı burada geçici olarak tutarız. Sonra `restoreOutstandingTasks`
+    /// remoteURL eşleşmesiyle dosyayı yerine taşır. Böylece %100 inmiş bir dosya
+    /// çöpe gitmez ve sıfırdan tekrar indirilmez.
+    static func pendingDirectory() throws -> URL {
+        let root = try rootDirectory()
+        let dir = root.appendingPathComponent("_pending", isDirectory: true)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: dir.path) {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? markExcludedFromBackup(dir)
+        }
+        return dir
+    }
+
+    /// Uzak URL'den kararlı (launch'lar arası sabit) bir anahtar üretir.
+    static func pendingKey(forRemoteURL remoteURL: String) -> String {
+        let digest = SHA256.hash(data: Data(remoteURL.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// İndirilen geçici dosyayı kurtarma klasörüne taşır. Başarılıysa true.
+    @discardableResult
+    static func storePendingFile(from location: URL, remoteURL: String) -> Bool {
+        guard let dir = try? pendingDirectory() else { return false }
+        let dest = dir.appendingPathComponent(pendingKey(forRemoteURL: remoteURL) + ".bin")
+        let fm = FileManager.default
+        do {
+            if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
+            try fm.moveItem(at: location, to: dest)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Kurtarma klasöründe bu URL'ye ait dosya varsa hedef relative path'e taşır
+    /// ve boyutunu döner. Yoksa nil.
+    static func takePendingFile(forRemoteURL remoteURL: String, to relativePath: String) -> Int64? {
+        guard let dir = try? pendingDirectory() else { return nil }
+        let source = dir.appendingPathComponent(pendingKey(forRemoteURL: remoteURL) + ".bin")
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: source.path) else { return nil }
+        do {
+            let destination = try ensureParentDirectory(for: relativePath)
+            if fm.fileExists(atPath: destination.path) { try? fm.removeItem(at: destination) }
+            try fm.moveItem(at: source, to: destination)
+            let attrs = try? fm.attributesOfItem(atPath: destination.path)
+            let size = (attrs?[.size] as? Int64) ?? 0
+            return size > 0 ? size : nil
+        } catch {
+            return nil
+        }
+    }
+
+    /// Belirli bir URL'ye ait bekleyen kurtarma dosyasını siler.
+    static func removePendingFile(forRemoteURL remoteURL: String) {
+        guard let dir = try? pendingDirectory() else { return }
+        let target = dir.appendingPathComponent(pendingKey(forRemoteURL: remoteURL) + ".bin")
+        try? FileManager.default.removeItem(at: target)
+    }
+
+    /// Kurtarma klasörünü temizler.
+    static func clearPendingFiles() {
+        guard let dir = try? pendingDirectory() else { return }
+        try? FileManager.default.removeItem(at: dir)
     }
 
     // MARK: - Storage stats
